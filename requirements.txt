@@ -3,3 +3,6 @@ requests
 configparser
 pycryptodomex
 beautifulsoup4
+pyinstaller
+pystray
+pillow
