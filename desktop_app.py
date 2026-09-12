@@ -195,6 +195,34 @@ class CSULibrary:
             logger.warning(f"座位 {seat_no} 预约失败: {msg}")
         return False, f"所有座位均预约失败，最后错误：{msg}", None
 
+    def get_future_reservations(self):
+        """查询已预约的未来座位（含明天）"""
+        self.login()
+        headers = {'Referer': 'http://libzw.csu.edu.cn/home/web/seat/area/1'}
+        # 尝试常见的未来预约接口
+        endpoints = [
+            "http://libzw.csu.edu.cn/api.php/futureuse",
+            "http://libzw.csu.edu.cn/api.php/reservations",
+            "http://libzw.csu.edu.cn/api.php/bookings",
+        ]
+        for url in endpoints:
+            try:
+                r = self.client.get(url, headers=headers, params={"user": self.userid}, timeout=15)
+                data = r.json()
+                if data.get('status') == 1 and data.get('data'):
+                    return data['data']
+            except Exception:
+                continue
+        # 兜底：尝试 currentuse 里是否包含未来预约
+        try:
+            r = self.client.get("http://libzw.csu.edu.cn/api.php/currentuse", headers=headers, params={"user": self.userid}, timeout=15)
+            data = r.json()
+            if data.get('status') == 1 and data.get('data'):
+                return data['data']
+        except Exception:
+            pass
+        return []
+
 
 # ================= 系统托盘 =================
 def create_tray_image():
@@ -371,6 +399,7 @@ class CSULibraryApp:
         btn_frame2.pack(fill=tk.X, padx=5, pady=5)
         ttk.Button(btn_frame2, text="▶️ 立即预约(含备选)", command=self.manual_reserve).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame2, text="🔄 刷新状态", command=self.refresh_status).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame2, text="📅 查询明天预约", command=self.query_tomorrow_reservation).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame2, text="🧹 清空日志", command=lambda: self._set_log("")).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame2, text="⏱️ 启动/停止定时", command=self.toggle_scheduler).pack(side=tk.RIGHT, padx=5)
 
@@ -543,6 +572,32 @@ class CSULibraryApp:
                 self._log("当前无占座记录")
         except Exception as e:
             self._log(f"查询失败: {e}")
+
+    def query_tomorrow_reservation(self):
+        """查询并显示明天（及未来）已预约的座位"""
+        self._log("正在查询已预约座位（含明天）...")
+        def _do():
+            try:
+                lib = CSULibrary(self.config["userid"], self.config["password"])
+                reservations = lib.get_future_reservations()
+                if not reservations:
+                    self._log("暂无已预约座位")
+                    return
+                # 过滤明天及之后的预约
+                tomorrow = (datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)).date()
+                self._log(f"=== 已预约座位列表 ===")
+                for r in reservations:
+                    # 兼容不同字段名
+                    seat_name = r.get('seatName') or r.get('name') or r.get('seat_name') or '未知座位'
+                    start = r.get('startTime') or r.get('start_time') or r.get('beginTime') or ''
+                    end = r.get('endTime') or r.get('end_time') or r.get('endTime') or ''
+                    status = r.get('status') or r.get('state') or ''
+                    area_name = r.get('areaName') or r.get('area_name') or ''
+                    self._log(f"  📍 {seat_name}  {area_name}  {start}~{end}  状态:{status}")
+                self._log("========================")
+            except Exception as e:
+                self._log(f"查询失败: {e}")
+        threading.Thread(target=_do, daemon=True).start()
 
     def toggle_scheduler(self):
         if self.scheduler.running:
