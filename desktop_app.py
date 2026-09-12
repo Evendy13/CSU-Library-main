@@ -54,9 +54,17 @@ DEFAULT_CONFIG = {
     "run_on_startup": False,
 }
 
-CAMPUS_OPTIONS = ["湘雅新校区", "新校区", "本部校区", "铁道校区"]
-CAMPUS_ID_MAP = {
-    "湘雅新校区": 71,
+CAMPUS_OPTIONS = ["杏林校区馆", "新校区", "本部校区", "铁道校区"]
+# 新版校区名映射（UI 显示名 -> CSV 文件名关键词）
+CAMPUS_CSV_MAP = {
+    "杏林校区馆": "湘雅新校区",  # CSV 文件仍叫 "湘雅新校区座位表.csv"
+    "新校区": "新校区",
+    "本部校区": "本部校区",
+    "铁道校区": "铁道校区",
+}
+# 新版 API 区域 ID 映射（需抓包确认，暂用旧 ID 占位）
+CAMPUS_AREA_ID = {
+    "杏林校区馆": 71,
     "新校区": 1,
     "铁道校区": 28,
     "本部校区": 94,
@@ -102,7 +110,9 @@ def save_config(cfg):
         return False
 
 def get_seat_csv_path(campus):
-    return SEAT_CSV_DIR / f"{campus}座位表.csv"
+    """campus 为 UI 显示名（如 '杏林校区馆'），映射到 CSV 文件名"""
+    csv_name = CAMPUS_CSV_MAP.get(campus, campus)
+    return SEAT_CSV_DIR / f"{csv_name}座位表.csv"
 
 def lookup_seat_id(campus, seat_no):
     """根据校区和座位号查找 seat_id 和 area"""
@@ -118,173 +128,288 @@ def lookup_seat_id(campus, seat_no):
         logger.error(f"查找座位失败: {e}")
     return None, None
 
-# ================= 核心预约逻辑（移植自 helper.py） =================
-def randomString(length):
-    aes_chars = 'ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678'
-    return ''.join(random.choice(aes_chars) for _ in range(length))
-
-def getAesString(data, key, iv):
-    data = str.encode(data)
-    data = pad(data, AES.block_size)
-    key = str.encode(key)
-    iv = str.encode(iv)
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    cipher_text = cipher.encrypt(data)
-    return str(base64.b64encode(cipher_text), encoding='utf-8')
-
+# ================= 核心预约逻辑（适配新版 h5 + 统一身份认证） =================
 class CSULibrary:
+    """新版 API：统一身份认证 + h5 座位系统"""
+    
+    # 新版校区映射（湘雅新校区 -> 杏林校区馆）
+    CAMPUS_NAME_MAP = {
+        "湘雅新校区": "杏林校区馆",
+        "新校区": "新校区",
+        "本部校区": "本部校区", 
+        "铁道校区": "铁道校区",
+    }
+    
     def __init__(self, userid, password):
         self.userid = userid
         self.password = password
         self.client = requests.Session()
-        self.seat_infos = []  # list of (seat_no, seat_id, area)
-
-    def login(self):
-        # 尝试多个可能的登录入口
-        login_urls = [
-            ("http://libzw.csu.edu.cn/cas/index.php", {"callback": "http://libzw.csu.edu.cn/home/web/f_second"}),
-            ("http://libzw.csu.edu.cn/cas/login", {"service": "http://libzw.csu.edu.cn/home/web/f_second"}),
-            ("https://libzw.csu.edu.cn/cas/login", {"service": "https://libzw.csu.edu.cn/home/web/f_second"}),
-            ("http://libzw.csu.edu.cn/cas/index.php", {}),
-        ]
+        self.client.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        })
+        self.access_token = None
+        self.refresh_token = None
         
-        for url1, params1 in login_urls:
-            try:
-                logger.info(f"尝试登录入口: {url1} params={params1}")
-                r1 = self.client.get(url1, params=params1, timeout=15, allow_redirects=False)
-                logger.info(f"登录页状态码: {r1.status_code}, URL: {r1.url}, 长度: {len(r1.text)}")
-                
-                if r1.status_code == 404:
-                    logger.warning(f"入口 {url1} 返回 404，尝试下一个")
-                    continue
-                    
-                # 如果是重定向，跟随重定向
-                if r1.status_code in (301, 302, 303, 307, 308):
-                    redirect_url = r1.headers.get('Location')
-                    logger.info(f"跟随重定向: {redirect_url}")
-                    r1 = self.client.get(redirect_url, timeout=15)
-                    logger.info(f"重定向后状态码: {r1.status_code}, URL: {r1.url}, 长度: {len(r1.text)}")
-                
-                soup = BeautifulSoup(r1.text, 'html.parser')
-                salt_input = soup.find('input', id="pwdEncryptSalt")
-                exec_input = soup.find('input', id="execution")
-                if not salt_input or not exec_input:
-                    # 尝试备选 id/name
-                    salt_input = (soup.find('input', id="salt") or 
-                                 soup.find('input', attrs={"name": "pwdEncryptSalt"}) or
-                                 soup.find('input', attrs={"name": "salt"}))
-                    exec_input = (soup.find('input', id="execution") or
-                                 soup.find('input', attrs={"name": "execution"}))
-                if not salt_input or not exec_input:
-                    logger.warning(f"入口 {url1} 找不到 salt/execution，HTML片段: {r1.text[:500]}")
-                    continue
-                    
-                salt = salt_input['value']
-                execution = exec_input['value']
-                logger.info(f"成功获取 salt/execution: salt长度={len(salt)}, execution={execution}")
-                
-                # 登录提交地址：优先用 form action，否则用当前 URL
-                form = soup.find('form')
-                url2 = form['action'] if form and form.get('action') else r1.url
-                if not url2.startswith('http'):
-                    from urllib.parse import urljoin
-                    url2 = urljoin(r1.url, url2)
-                
-                data2 = {
-                    'username': self.userid,
-                    'password': getAesString(randomString(64)+self.password, salt, randomString(16)),
-                    'captcha': '',
-                    '_eventId': 'submit',
-                    'cllt': 'userNameLogin',
-                    'dllt': 'generalLogin',
-                    'lt': '',
-                    'execution': execution
-                }
-                r2 = self.client.post(url2, data=data2, timeout=15, allow_redirects=True)
-                logger.info(f"登录提交状态码: {r2.status_code}, 最终URL: {r2.url}, Cookie: {dict(self.client.cookies)}")
-                
-                if "access_token" in self.client.cookies:
-                    logger.info("登录成功，获取到 access_token")
-                    return True
-                else:
-                    logger.warning(f"登录提交未获取 access_token, 响应: {r2.text[:500]}")
-                    
-            except Exception as e:
-                logger.warning(f"入口 {url1} 尝试失败: {e}")
-                continue
-                
-        raise Exception("所有登录入口均失败，可能需要更新登录逻辑或检查网络")
-
-    def get_book_time_ids(self, area):
-        url = f"http://libzw.csu.edu.cn/api.php/v3areadays/{area}"
-        headers = {'Referer': 'http://libzw.csu.edu.cn/home/web/seat/area/1'}
-        r = self.client.get(url, headers=headers, timeout=15)
-        data = r.json()["data"]["list"]
-        return data[0]["id"], data[1]["id"]  # today, tomorrow
-
-    def reserve_seat(self, seat_id, segment):
-        url = f"http://libzw.csu.edu.cn/api.php/spaces/{seat_id}/book"
-        headers = {'Referer': 'http://libzw.csu.edu.cn/home/web/seat/area/1'}
-        access_token = self.client.cookies.get('access_token')
-        data = {
-            'access_token': access_token,
-            'userid': self.userid,
-            'segment': segment,
-            'type': '1',
-            'operateChannel': '2'
+    def login(self):
+        """新版登录流程：CAS 统一身份认证 -> 获取 token"""
+        logger.info("开始新版登录流程...")
+        
+        # 1. 先访问 h5 首页建立会话
+        try:
+            r = self.client.get("https://libzw.csu.edu.cn/h5/index.html", timeout=15)
+            logger.info(f"访问 h5 首页: {r.status_code}")
+        except Exception as e:
+            logger.warning(f"访问 h5 首页失败: {e}")
+        
+        # 2. 访问 CAS 登录页
+        cas_login_url = "https://ca.csu.edu.cn/authserver/login"
+        service_url = "https://libzw.csu.edu.cn/v4/login/cas"
+        params = {"service": service_url}
+        
+        try:
+            r1 = self.client.get(cas_login_url, params=params, timeout=15)
+            logger.info(f"CAS 登录页: {r1.status_code}, URL: {r1.url}")
+        except Exception as e:
+            logger.error(f"访问 CAS 登录页失败: {e}")
+            raise Exception(f"无法访问统一身份认证平台: {e}")
+        
+        # 3. 解析登录表单
+        soup = BeautifulSoup(r1.text, 'html.parser')
+        form = soup.find('form', id='casLoginForm') or soup.find('form')
+        if not form:
+            logger.error(f"CAS 登录页无表单: {r1.text[:2000]}")
+            raise Exception("CAS 登录页结构异常，找不到登录表单")
+        
+        # 提取隐藏字段
+        form_data = {}
+        for inp in form.find_all('input', type='hidden'):
+            name = inp.get('name')
+            value = inp.get('value', '')
+            if name:
+                form_data[name] = value
+        
+        # 常见字段名
+        form_data.setdefault('username', self.userid)
+        form_data.setdefault('password', self.password)
+        form_data.setdefault('rememberMe', 'true')
+        
+        # 登录提交地址
+        action = form.get('action', cas_login_url)
+        if not action.startswith('http'):
+            from urllib.parse import urljoin
+            action = urljoin(r1.url, action)
+        
+        logger.info(f"提交登录表单到: {action}")
+        logger.info(f"表单字段: {list(form_data.keys())}")
+        
+        # 4. 提交登录
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': 'https://ca.csu.edu.cn',
+            'Referer': r1.url,
         }
-        r = self.client.post(url, headers=headers, data=data, timeout=15)
+        
+        try:
+            r2 = self.client.post(action, data=form_data, headers=headers, timeout=20, allow_redirects=True)
+            logger.info(f"登录提交: {r2.status_code}, 最终URL: {r2.url}")
+            
+            # 检查是否登录成功（通常会重定向回 service_url 并带上 ticket）
+            if 'ticket=' in r2.url or 'token' in r2.url or r2.url.startswith('https://libzw.csu.edu.cn'):
+                logger.info("CAS 登录成功，重定向回图书馆系统")
+            else:
+                logger.warning(f"登录可能失败，响应: {r2.text[:500]}")
+                
+        except Exception as e:
+            logger.error(f"登录提交异常: {e}")
+            raise Exception(f"登录提交失败: {e}")
+        
+        # 5. 回到图书馆系统，获取 token
+        # 尝试调用 v4 获取 token 的接口
+        try:
+            # 先访问 h5 座位页建立上下文
+            self.client.get("https://libzw.csu.edu.cn/h5/index.html#/seat", timeout=15)
+            
+            # 尝试获取 token（新版可能用 Authorization header 或 cookie）
+            token_endpoints = [
+                "https://libzw.csu.edu.cn/v4/auth/token",
+                "https://libzw.csu.edu.cn/v4/user/token",
+                "https://libzw.csu.edu.cn/api/v1/auth/token",
+            ]
+            for ep in token_endpoints:
+                try:
+                    r = self.client.get(ep, timeout=10)
+                    if r.status_code == 200:
+                        data = r.json()
+                        if 'access_token' in data:
+                            self.access_token = data['access_token']
+                            self.client.headers['Authorization'] = f"Bearer {self.access_token}"
+                            logger.info(f"获取到 access_token: {self.access_token[:20]}...")
+                            break
+                        elif 'token' in data:
+                            self.access_token = data['token']
+                            self.client.headers['Authorization'] = f"Bearer {self.access_token}"
+                            logger.info(f"获取到 token: {self.access_token[:20]}...")
+                            break
+                except:
+                    continue
+                    
+            # 如果 cookie 里有 token
+            for cookie in self.client.cookies:
+                if 'token' in cookie.name.lower() or cookie.name == 'access_token':
+                    self.access_token = cookie.value
+                    self.client.headers['Authorization'] = f"Bearer {self.access_token}"
+                    logger.info(f"从 Cookie 获取 token: {self.access_token[:20]}...")
+                    break
+                    
+        except Exception as e:
+            logger.warning(f"获取 token 过程异常: {e}")
+        
+        # 6. 验证登录状态
+        if self._check_login():
+            logger.info("登录验证通过")
+            return True
+        else:
+            logger.error("登录验证失败")
+            raise Exception("登录失败，请检查账号密码或网络")
+    
+    def _check_login(self):
+        """验证登录状态"""
+        try:
+            # 尝试调用需要认证的接口
+            r = self.client.get("https://libzw.csu.edu.cn/v4/user/info", timeout=10)
+            if r.status_code == 200:
+                return True
+            # 备选：查询座位列表
+            r = self.client.get("https://libzw.csu.edu.cn/v4/seat/areas", timeout=10)
+            return r.status_code == 200
+        except:
+            return False
+    
+    def _get_headers(self):
+        """获取请求头"""
+        headers = {
+            'Referer': 'https://libzw.csu.edu.cn/h5/index.html',
+            'Origin': 'https://libzw.csu.edu.cn',
+        }
+        if self.access_token:
+            headers['Authorization'] = f'Bearer {self.access_token}'
+        return headers
+    
+    def get_areas(self):
+        """获取区域列表（新版 v4 API）"""
+        url = "https://libzw.csu.edu.cn/v4/seat/areas"
+        r = self.client.get(url, headers=self._get_headers(), timeout=15)
+        logger.info(f"获取区域列表: {r.status_code}")
         return r.json()
-
+    
+    def get_area_detail(self, area_id):
+        """获取区域详情（包含子区域和座位）"""
+        url = f"https://libzw.csu.edu.cn/v4/seat/areas/{area_id}"
+        r = self.client.get(url, headers=self._get_headers(), timeout=15)
+        return r.json()
+    
+    def get_seats(self, area_id, segment_id, date_str):
+        """获取指定区域、时段、日期的座位列表"""
+        url = f"https://libzw.csu.edu.cn/v4/seat/list"
+        params = {
+            'area_id': area_id,
+            'segment_id': segment_id,
+            'date': date_str,
+        }
+        r = self.client.get(url, params=params, headers=self._get_headers(), timeout=15)
+        return r.json()
+    
+    def get_segments(self, area_id, date_str):
+        """获取区域的时段列表"""
+        url = f"https://libzw.csu.edu.cn/v4/seat/segments"
+        params = {'area_id': area_id, 'date': date_str}
+        r = self.client.get(url, params=params, headers=self._get_headers(), timeout=15)
+        return r.json()
+    
+    def reserve(self, seat_id, segment_id, date_str):
+        """预约座位"""
+        url = "https://libzw.csu.edu.cn/v4/seat/reserve"
+        data = {
+            'seat_id': seat_id,
+            'segment_id': segment_id,
+            'date': date_str,
+            'user_id': self.userid,
+        }
+        r = self.client.post(url, json=data, headers=self._get_headers(), timeout=15)
+        return r.json()
+    
+    def get_my_reservations(self):
+        """获取我的预约（含未来）"""
+        url = "https://libzw.csu.edu.cn/v4/user/reservations"
+        r = self.client.get(url, headers=self._get_headers(), timeout=15)
+        return r.json()
+    
+    def cancel_reservation(self, reservation_id):
+        """取消预约"""
+        url = f"https://libzw.csu.edu.cn/v4/seat/cancel/{reservation_id}"
+        r = self.client.post(url, headers=self._get_headers(), timeout=15)
+        return r.json()
+    
+    # 兼容旧接口方法（供现有调用处使用）
+    def get_book_time_ids(self, area):
+        """兼容：获取时段 ID（新版用 segment_id）"""
+        # 尝试用新版 API
+        try:
+            tomorrow = (datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)).strftime('%Y-%m-%d')
+            segments = self.get_segments(area, tomorrow)
+            if segments.get('data'):
+                segs = segments['data']
+                if len(segs) >= 2:
+                    return segs[0].get('id', ''), segs[1].get('id', '')
+        except Exception as e:
+            logger.warning(f"新版 get_segments 失败: {e}")
+        return '', ''
+    
+    def reserve_seat(self, seat_id, segment):
+        """兼容：预约座位"""
+        tomorrow = (datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)).strftime('%Y-%m-%d')
+        return self.reserve(seat_id, segment, tomorrow)
+    
     def try_reserve_sequence(self, seat_infos):
-        """依次尝试预约多个座位，返回 (success, message, seat_no)"""
+        """依次尝试预约多个座位"""
         self.login()
+        tomorrow = (datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)).strftime('%Y-%m-%d')
+        
         for seat_no, seat_id, area in seat_infos:
-            _, tomorrow_id = self.get_book_time_ids(area)
-            result = self.reserve_seat(seat_id, tomorrow_id)
-            msg = result.get('msg', '未知错误')
-            if result.get('status') == 1:
+            # 获取该区域明天的时段
+            try:
+                segments = self.get_segments(area, tomorrow)
+                seg_list = segments.get('data', [])
+                if not seg_list:
+                    logger.warning(f"区域 {area} 无可用时段")
+                    continue
+                # 取全天时段（通常最后一个或第一个）
+                segment_id = seg_list[-1].get('id') or seg_list[0].get('id')
+            except Exception as e:
+                logger.warning(f"获取时段失败: {e}")
+                continue
+            
+            result = self.reserve(seat_id, segment_id, tomorrow)
+            msg = result.get('msg', result.get('message', '未知错误'))
+            if result.get('code') == 200 or result.get('status') == 1 or result.get('success') == True:
                 return True, f"预约成功：{msg}", seat_no
             logger.warning(f"座位 {seat_no} 预约失败: {msg}")
-        return False, f"所有座位均预约失败，最后错误：{msg}", None
-
+        return False, f"所有座位均预约失败", None
+    
     def get_future_reservations(self):
-        """查询已预约的未来座位（含明天）"""
+        """查询已预约的未来座位"""
         self.login()
-        headers = {'Referer': 'http://libzw.csu.edu.cn/home/web/seat/area/1'}
-        # 尝试常见的未来预约接口
-        endpoints = [
-            "http://libzw.csu.edu.cn/api.php/futureuse",
-            "http://libzw.csu.edu.cn/api.php/reservations",
-            "http://libzw.csu.edu.cn/api.php/bookings",
-        ]
-        for url in endpoints:
-            try:
-                r = self.client.get(url, headers=headers, params={"user": self.userid}, timeout=15)
-                data = r.json()
-                logger.info(f"API {url} 返回: {data}")
-                if isinstance(data, dict) and data.get('status') == 1:
-                    d = data.get('data')
-                    if isinstance(d, list) and d:
-                        return d
-                    elif isinstance(d, dict):
-                        return [d]  # 单对象包成列表
-            except Exception as e:
-                logger.warning(f"接口 {url} 失败: {e}")
-                continue
-        # 兜底：尝试 currentuse 里是否包含未来预约
         try:
-            r = self.client.get("http://libzw.csu.edu.cn/api.php/currentuse", headers=headers, params={"user": self.userid}, timeout=15)
-            data = r.json()
-            logger.info(f"API currentuse 返回: {data}")
-            if isinstance(data, dict) and data.get('status') == 1:
-                d = data.get('data')
-                if isinstance(d, list) and d:
-                    return d
-                elif isinstance(d, dict):
-                    return [d]
+            data = self.get_my_reservations()
+            logger.info(f"获取预约列表: {data}")
+            if isinstance(data, dict) and data.get('code') == 200:
+                return data.get('data', [])
+            elif isinstance(data, list):
+                return data
         except Exception as e:
-            logger.warning(f"currentuse 失败: {e}")
+            logger.warning(f"获取预约列表失败: {e}")
         return []
 
 
@@ -544,8 +669,9 @@ class CSULibraryApp:
         messagebox.showinfo("验证结果", "\n".join(results))
 
     def open_web(self):
-        webbrowser.open("http://libzw.csu.edu.cn/home/web/seat/area/1")
-        self._log("已打开图书馆预约网页")
+        # 新版 h5 座位系统
+        webbrowser.open("https://libzw.csu.edu.cn/h5/index.html#/seat")
+        self._log("已打开新版图书馆预约网页 (h5)")
 
     def _collect_seat_infos(self):
         """收集主座位+备选座位的 (seat_no, seat_id, area) 列表"""
@@ -622,21 +748,21 @@ class CSULibraryApp:
 
     def refresh_status(self):
         self._log("正在查询当前占座状态...")
-        try:
-            lib = CSULibrary(self.config["userid"], self.config["password"])
-            lib.login()
-            url = "http://libzw.csu.edu.cn/api.php/currentuse"
-            headers = {"Referer": "http://libzw.csu.edu.cn/home/web/seat/area/1"}
-            params = {"user": self.config["userid"]}
-            r = lib.client.get(url, headers=headers, params=params, timeout=15)
-            data = r.json().get('data', [])
-            if data:
-                d = data[0]
-                self._log(f"当前占座: {d.get('seatName', '')} {d.get('startTime', '')}-{d.get('endTime', '')}")
-            else:
-                self._log("当前无占座记录")
-        except Exception as e:
-            self._log(f"查询失败: {e}")
+        def _do():
+            try:
+                lib = CSULibrary(self.config["userid"], self.config["password"])
+                lib.login()
+                # 新版：获取当前使用中的座位
+                r = lib.client.get("https://libzw.csu.edu.cn/v4/user/current", headers=lib._get_headers(), timeout=15)
+                data = r.json()
+                if data.get('code') == 200 and data.get('data'):
+                    d = data['data']
+                    self._log(f"当前占座: {d.get('seatName', '')} {d.get('startTime', '')}-{d.get('endTime', '')}")
+                else:
+                    self._log("当前无占座记录")
+            except Exception as e:
+                self._log(f"查询失败: {e}")
+        threading.Thread(target=_do, daemon=True).start()
 
     def query_tomorrow_reservation(self):
         """查询并显示明天（及未来）已预约的座位"""
@@ -658,12 +784,12 @@ class CSULibraryApp:
                 for r in reservations:
                     if not isinstance(r, dict):
                         continue
-                    # 兼容不同字段名
-                    seat_name = r.get('seatName') or r.get('name') or r.get('seat_name') or '未知座位'
-                    start = r.get('startTime') or r.get('start_time') or r.get('beginTime') or ''
-                    end = r.get('endTime') or r.get('end_time') or r.get('endTime') or ''
+                    # 新版 v4 API 字段名兼容
+                    seat_name = r.get('seat_name') or r.get('seatName') or r.get('name') or '未知座位'
+                    start = r.get('start_time') or r.get('startTime') or r.get('beginTime') or ''
+                    end = r.get('end_time') or r.get('endTime') or r.get('endTime') or ''
                     status = r.get('status') or r.get('state') or ''
-                    area_name = r.get('areaName') or r.get('area_name') or ''
+                    area_name = r.get('area_name') or r.get('areaName') or r.get('library_name') or ''
                     self._log(f"  📍 {seat_name}  {area_name}  {start}~{end}  状态:{status}")
                 self._log("========================")
             except Exception as e:
