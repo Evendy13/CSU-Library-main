@@ -209,18 +209,29 @@ class CSULibrary:
             try:
                 r = self.client.get(url, headers=headers, params={"user": self.userid}, timeout=15)
                 data = r.json()
-                if data.get('status') == 1 and data.get('data'):
-                    return data['data']
-            except Exception:
+                logger.debug(f"API {url} 返回: {data}")
+                if isinstance(data, dict) and data.get('status') == 1:
+                    d = data.get('data')
+                    if isinstance(d, list) and d:
+                        return d
+                    elif isinstance(d, dict):
+                        return [d]  # 单对象包成列表
+            except Exception as e:
+                logger.warning(f"接口 {url} 失败: {e}")
                 continue
         # 兜底：尝试 currentuse 里是否包含未来预约
         try:
             r = self.client.get("http://libzw.csu.edu.cn/api.php/currentuse", headers=headers, params={"user": self.userid}, timeout=15)
             data = r.json()
-            if data.get('status') == 1 and data.get('data'):
-                return data['data']
-        except Exception:
-            pass
+            logger.debug(f"API currentuse 返回: {data}")
+            if isinstance(data, dict) and data.get('status') == 1:
+                d = data.get('data')
+                if isinstance(d, list) and d:
+                    return d
+                elif isinstance(d, dict):
+                    return [d]
+        except Exception as e:
+            logger.warning(f"currentuse 失败: {e}")
         return []
 
 
