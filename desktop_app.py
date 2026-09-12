@@ -465,6 +465,7 @@ class CSULibraryApp:
         ttk.Button(btn_frame2, text="🔄 刷新状态", command=self.refresh_status).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame2, text="📅 查询明天预约", command=self.query_tomorrow_reservation).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame2, text="🧹 清空日志", command=lambda: self._set_log("")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame2, text="📂 打开日志文件", command=self.open_log_file).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame2, text="⏱️ 启动/停止定时", command=self.toggle_scheduler).pack(side=tk.RIGHT, padx=5)
 
         # 底部状态栏
@@ -696,6 +697,21 @@ class CSULibraryApp:
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    def open_log_file(self):
+        """打开日志文件所在文件夹，或直接用记事本打开日志文件"""
+        log_path = LOG_FILE
+        if log_path.exists():
+            try:
+                os.startfile(str(log_path))  # 用默认关联程序打开（通常是记事本）
+                self._log(f"已打开日志文件: {log_path}")
+            except Exception as e:
+                # 兜底：打开所在文件夹
+                os.startfile(str(CONFIG_DIR))
+                self._log(f"打开日志文件失败，已打开所在文件夹: {CONFIG_DIR}")
+        else:
+            os.startfile(str(CONFIG_DIR))
+            self._log(f"日志文件不存在，已打开配置目录: {CONFIG_DIR}")
 
     def _start_tray(self):
         if self.tray:
