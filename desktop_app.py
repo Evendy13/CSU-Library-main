@@ -182,25 +182,24 @@ class CSULibrary:
             logger.error(f"CAS 登录页无表单: {r1.text[:2000]}")
             raise Exception("CAS 登录页结构异常，找不到登录表单")
         
-        # 提取隐藏字段
+        # 提取所有隐藏字段（lt, execution, _eventId 等）
         form_data = {}
-        for inp in form.find_all('input', type='hidden'):
+        for inp in form.find_all('input'):
             name = inp.get('name')
             value = inp.get('value', '')
             if name:
                 form_data[name] = value
         
-        # 关键：设置校内用户登录模式
+        # 关键字段
         form_data['username'] = self.userid
-        form_data['password'] = self.password
+        form_data['password'] = self.password  # 可能需要加密，先试明文
         form_data['cllt'] = 'userNameLogin'      # 账号密码登录
         form_data['dllt'] = 'generalLogin'       # 普通登录
         form_data['responseJson'] = 'true'       # 返回 JSON
         form_data['rememberMe'] = 'true'
-        # lt 和 execution 从隐藏字段获取
         
         # 登录提交地址
-        action = form.get('action', cas_login_url)
+        action = form.get('action', 'https://ca.csu.edu.cn/authserver/login')
         if not action.startswith('http'):
             from urllib.parse import urljoin
             action = urljoin(r1.url, action)
@@ -220,23 +219,30 @@ class CSULibrary:
         try:
             r2 = self.client.post(action, data=form_data, headers=headers, timeout=20)
             logger.info(f"登录提交: {r2.status_code}, 最终URL: {r2.url}")
-            logger.info(f"登录响应: {r2.text[:500]}")
+            logger.info(f"登录响应前200字符: {r2.text[:200]}")
             
-            # 处理 JSON 响应
+            # 处理响应（可能含 UTF-8 BOM）
+            resp_text = r2.text
+            if resp_text.startswith('\ufeff'):
+                resp_text = resp_text[1:]
+            
+            # 尝试解析 JSON
             try:
-                resp_json = r2.json()
+                resp_json = json.loads(resp_text)
                 logger.info(f"登录 JSON 响应: {resp_json}")
-                if resp_json.get('success') or resp_json.get('code') == 200:
+                if resp_json.get('success') or resp_json.get('code') == 200 or resp_json.get('result') == 'success':
                     logger.info("CAS 登录成功 (JSON)")
                 else:
-                    logger.warning(f"登录失败: {resp_json.get('message', '未知错误')}")
-                    raise Exception(f"登录失败: {resp_json.get('message', '未知错误')}")
-            except:
-                # 非 JSON 响应，检查重定向
-                if 'ticket=' in r2.url or 'token' in r2.url or r2.url.startswith('https://libzw.csu.edu.cn'):
+                    msg = resp_json.get('message') or resp_json.get('msg') or '未知错误'
+                    logger.warning(f"登录失败: {msg}")
+                    raise Exception(f"登录失败: {msg}")
+            except json.JSONDecodeError:
+                # 非 JSON 响应，检查重定向或 HTML
+                logger.warning(f"响应非 JSON: {r2.text[:300]}")
+                if 'ticket=' in r2.url or r2.url.startswith('https://libzw.csu.edu.cn'):
                     logger.info("CAS 登录成功，重定向回图书馆系统")
                 else:
-                    logger.warning(f"登录可能失败，响应: {r2.text[:500]}")
+                    logger.warning(f"登录可能失败，响应: {r2.text[:300]}")
                     raise Exception("登录失败，未获取到有效响应")
                 
         except Exception as e:
