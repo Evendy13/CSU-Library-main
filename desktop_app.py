@@ -190,10 +190,14 @@ class CSULibrary:
             if name:
                 form_data[name] = value
         
-        # 常见字段名
-        form_data.setdefault('username', self.userid)
-        form_data.setdefault('password', self.password)
-        form_data.setdefault('rememberMe', 'true')
+        # 关键：设置校内用户登录模式
+        form_data['username'] = self.userid
+        form_data['password'] = self.password
+        form_data['cllt'] = 'userNameLogin'      # 账号密码登录
+        form_data['dllt'] = 'generalLogin'       # 普通登录
+        form_data['responseJson'] = 'true'       # 返回 JSON
+        form_data['rememberMe'] = 'true'
+        # lt 和 execution 从隐藏字段获取
         
         # 登录提交地址
         action = form.get('action', cas_login_url)
@@ -209,17 +213,31 @@ class CSULibrary:
             'Content-Type': 'application/x-www-form-urlencoded',
             'Origin': 'https://ca.csu.edu.cn',
             'Referer': r1.url,
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest',
         }
         
         try:
-            r2 = self.client.post(action, data=form_data, headers=headers, timeout=20, allow_redirects=True)
+            r2 = self.client.post(action, data=form_data, headers=headers, timeout=20)
             logger.info(f"登录提交: {r2.status_code}, 最终URL: {r2.url}")
+            logger.info(f"登录响应: {r2.text[:500]}")
             
-            # 检查是否登录成功（通常会重定向回 service_url 并带上 ticket）
-            if 'ticket=' in r2.url or 'token' in r2.url or r2.url.startswith('https://libzw.csu.edu.cn'):
-                logger.info("CAS 登录成功，重定向回图书馆系统")
-            else:
-                logger.warning(f"登录可能失败，响应: {r2.text[:500]}")
+            # 处理 JSON 响应
+            try:
+                resp_json = r2.json()
+                logger.info(f"登录 JSON 响应: {resp_json}")
+                if resp_json.get('success') or resp_json.get('code') == 200:
+                    logger.info("CAS 登录成功 (JSON)")
+                else:
+                    logger.warning(f"登录失败: {resp_json.get('message', '未知错误')}")
+                    raise Exception(f"登录失败: {resp_json.get('message', '未知错误')}")
+            except:
+                # 非 JSON 响应，检查重定向
+                if 'ticket=' in r2.url or 'token' in r2.url or r2.url.startswith('https://libzw.csu.edu.cn'):
+                    logger.info("CAS 登录成功，重定向回图书馆系统")
+                else:
+                    logger.warning(f"登录可能失败，响应: {r2.text[:500]}")
+                    raise Exception("登录失败，未获取到有效响应")
                 
         except Exception as e:
             logger.error(f"登录提交异常: {e}")
