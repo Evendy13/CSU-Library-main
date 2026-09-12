@@ -143,9 +143,19 @@ class CSULibrary:
         url1 = "http://libzw.csu.edu.cn/cas/index.php"
         params1 = {"callback": "http://libzw.csu.edu.cn/home/web/f_second"}
         r1 = self.client.get(url1, params=params1, timeout=15)
+        logger.info(f"登录页状态码: {r1.status_code}, URL: {r1.url}, 长度: {len(r1.text)}")
         soup = BeautifulSoup(r1.text, 'html.parser')
-        salt = soup.find('input', id="pwdEncryptSalt")['value']
-        execution = soup.find('input', id="execution")['value']
+        salt_input = soup.find('input', id="pwdEncryptSalt")
+        exec_input = soup.find('input', id="execution")
+        if not salt_input or not exec_input:
+            # 尝试备选 id
+            salt_input = soup.find('input', id="salt") or soup.find('input', attrs={"name": "pwdEncryptSalt"})
+            exec_input = soup.find('input', id="execution") or soup.find('input', attrs={"name": "execution"})
+        if not salt_input or not exec_input:
+            logger.error(f"登录页 HTML 片段: {r1.text[:2000]}")
+            raise Exception("登录页结构异常，找不到 salt/execution，可能需要更新解析逻辑")
+        salt = salt_input['value']
+        execution = exec_input['value']
         url2 = r1.url
         data2 = {
             'username': self.userid,
@@ -158,6 +168,7 @@ class CSULibrary:
             'execution': execution
         }
         r2 = self.client.post(url2, data=data2, timeout=15)
+        logger.info(f"登录提交状态码: {r2.status_code}, Cookie: {dict(self.client.cookies)}")
         if "access_token" not in self.client.cookies:
             raise Exception("登录失败，请检查账号密码")
         return True
