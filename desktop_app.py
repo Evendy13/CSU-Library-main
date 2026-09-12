@@ -209,7 +209,7 @@ class CSULibrary:
             try:
                 r = self.client.get(url, headers=headers, params={"user": self.userid}, timeout=15)
                 data = r.json()
-                logger.debug(f"API {url} 返回: {data}")
+                logger.info(f"API {url} 返回: {data}")
                 if isinstance(data, dict) and data.get('status') == 1:
                     d = data.get('data')
                     if isinstance(d, list) and d:
@@ -223,7 +223,7 @@ class CSULibrary:
         try:
             r = self.client.get("http://libzw.csu.edu.cn/api.php/currentuse", headers=headers, params={"user": self.userid}, timeout=15)
             data = r.json()
-            logger.debug(f"API currentuse 返回: {data}")
+            logger.info(f"API currentuse 返回: {data}")
             if isinstance(data, dict) and data.get('status') == 1:
                 d = data.get('data')
                 if isinstance(d, list) and d:
