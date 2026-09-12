@@ -140,38 +140,80 @@ class CSULibrary:
         self.seat_infos = []  # list of (seat_no, seat_id, area)
 
     def login(self):
-        url1 = "http://libzw.csu.edu.cn/cas/index.php"
-        params1 = {"callback": "http://libzw.csu.edu.cn/home/web/f_second"}
-        r1 = self.client.get(url1, params=params1, timeout=15)
-        logger.info(f"登录页状态码: {r1.status_code}, URL: {r1.url}, 长度: {len(r1.text)}")
-        soup = BeautifulSoup(r1.text, 'html.parser')
-        salt_input = soup.find('input', id="pwdEncryptSalt")
-        exec_input = soup.find('input', id="execution")
-        if not salt_input or not exec_input:
-            # 尝试备选 id
-            salt_input = soup.find('input', id="salt") or soup.find('input', attrs={"name": "pwdEncryptSalt"})
-            exec_input = soup.find('input', id="execution") or soup.find('input', attrs={"name": "execution"})
-        if not salt_input or not exec_input:
-            logger.error(f"登录页 HTML 片段: {r1.text[:2000]}")
-            raise Exception("登录页结构异常，找不到 salt/execution，可能需要更新解析逻辑")
-        salt = salt_input['value']
-        execution = exec_input['value']
-        url2 = r1.url
-        data2 = {
-            'username': self.userid,
-            'password': getAesString(randomString(64)+self.password, salt, randomString(16)),
-            'captcha': '',
-            '_eventId': 'submit',
-            'cllt': 'userNameLogin',
-            'dllt': 'generalLogin',
-            'lt': '',
-            'execution': execution
-        }
-        r2 = self.client.post(url2, data=data2, timeout=15)
-        logger.info(f"登录提交状态码: {r2.status_code}, Cookie: {dict(self.client.cookies)}")
-        if "access_token" not in self.client.cookies:
-            raise Exception("登录失败，请检查账号密码")
-        return True
+        # 尝试多个可能的登录入口
+        login_urls = [
+            ("http://libzw.csu.edu.cn/cas/index.php", {"callback": "http://libzw.csu.edu.cn/home/web/f_second"}),
+            ("http://libzw.csu.edu.cn/cas/login", {"service": "http://libzw.csu.edu.cn/home/web/f_second"}),
+            ("https://libzw.csu.edu.cn/cas/login", {"service": "https://libzw.csu.edu.cn/home/web/f_second"}),
+            ("http://libzw.csu.edu.cn/cas/index.php", {}),
+        ]
+        
+        for url1, params1 in login_urls:
+            try:
+                logger.info(f"尝试登录入口: {url1} params={params1}")
+                r1 = self.client.get(url1, params=params1, timeout=15, allow_redirects=False)
+                logger.info(f"登录页状态码: {r1.status_code}, URL: {r1.url}, 长度: {len(r1.text)}")
+                
+                if r1.status_code == 404:
+                    logger.warning(f"入口 {url1} 返回 404，尝试下一个")
+                    continue
+                    
+                # 如果是重定向，跟随重定向
+                if r1.status_code in (301, 302, 303, 307, 308):
+                    redirect_url = r1.headers.get('Location')
+                    logger.info(f"跟随重定向: {redirect_url}")
+                    r1 = self.client.get(redirect_url, timeout=15)
+                    logger.info(f"重定向后状态码: {r1.status_code}, URL: {r1.url}, 长度: {len(r1.text)}")
+                
+                soup = BeautifulSoup(r1.text, 'html.parser')
+                salt_input = soup.find('input', id="pwdEncryptSalt")
+                exec_input = soup.find('input', id="execution")
+                if not salt_input or not exec_input:
+                    # 尝试备选 id/name
+                    salt_input = (soup.find('input', id="salt") or 
+                                 soup.find('input', attrs={"name": "pwdEncryptSalt"}) or
+                                 soup.find('input', attrs={"name": "salt"}))
+                    exec_input = (soup.find('input', id="execution") or
+                                 soup.find('input', attrs={"name": "execution"}))
+                if not salt_input or not exec_input:
+                    logger.warning(f"入口 {url1} 找不到 salt/execution，HTML片段: {r1.text[:500]}")
+                    continue
+                    
+                salt = salt_input['value']
+                execution = exec_input['value']
+                logger.info(f"成功获取 salt/execution: salt长度={len(salt)}, execution={execution}")
+                
+                # 登录提交地址：优先用 form action，否则用当前 URL
+                form = soup.find('form')
+                url2 = form['action'] if form and form.get('action') else r1.url
+                if not url2.startswith('http'):
+                    from urllib.parse import urljoin
+                    url2 = urljoin(r1.url, url2)
+                
+                data2 = {
+                    'username': self.userid,
+                    'password': getAesString(randomString(64)+self.password, salt, randomString(16)),
+                    'captcha': '',
+                    '_eventId': 'submit',
+                    'cllt': 'userNameLogin',
+                    'dllt': 'generalLogin',
+                    'lt': '',
+                    'execution': execution
+                }
+                r2 = self.client.post(url2, data=data2, timeout=15, allow_redirects=True)
+                logger.info(f"登录提交状态码: {r2.status_code}, 最终URL: {r2.url}, Cookie: {dict(self.client.cookies)}")
+                
+                if "access_token" in self.client.cookies:
+                    logger.info("登录成功，获取到 access_token")
+                    return True
+                else:
+                    logger.warning(f"登录提交未获取 access_token, 响应: {r2.text[:500]}")
+                    
+            except Exception as e:
+                logger.warning(f"入口 {url1} 尝试失败: {e}")
+                continue
+                
+        raise Exception("所有登录入口均失败，可能需要更新登录逻辑或检查网络")
 
     def get_book_time_ids(self, area):
         url = f"http://libzw.csu.edu.cn/api.php/v3areadays/{area}"
