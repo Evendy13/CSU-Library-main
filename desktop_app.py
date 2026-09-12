@@ -591,13 +591,19 @@ class CSULibraryApp:
             try:
                 lib = CSULibrary(self.config["userid"], self.config["password"])
                 reservations = lib.get_future_reservations()
+                logger.info(f"get_future_reservations 返回类型: {type(reservations)}, 值: {reservations}")
                 if not reservations:
                     self._log("暂无已预约座位")
+                    return
+                if not isinstance(reservations, list):
+                    self._log(f"响应结构异常，非列表: {reservations}")
                     return
                 # 过滤明天及之后的预约
                 tomorrow = (datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)).date()
                 self._log(f"=== 已预约座位列表 ===")
                 for r in reservations:
+                    if not isinstance(r, dict):
+                        continue
                     # 兼容不同字段名
                     seat_name = r.get('seatName') or r.get('name') or r.get('seat_name') or '未知座位'
                     start = r.get('startTime') or r.get('start_time') or r.get('beginTime') or ''
@@ -607,6 +613,8 @@ class CSULibraryApp:
                     self._log(f"  📍 {seat_name}  {area_name}  {start}~{end}  状态:{status}")
                 self._log("========================")
             except Exception as e:
+                import traceback
+                logger.exception("查询异常")
                 self._log(f"查询失败: {e}")
         threading.Thread(target=_do, daemon=True).start()
 
